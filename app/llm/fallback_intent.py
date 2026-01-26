@@ -17,12 +17,9 @@ HS_CODE_MAP = {
 # We keep values short (e.g. "Тамхи") and expect builder.py to use ILIKE '%...%'
 CATEGORY_KEYWORDS: Dict[str, str] = {
     "тамхи, суудлын автомашин": "sub3",
-    "хүнс, автобензин": "sub2",  # based on your example: sub2 = "1.1.1 Хүнс"
-    "түргэн эдэлгээтэй": "ub1",
+    "хүнс, автобензин": "sub2",
+    "түргэн эдэлгээтэй": "sub1",  # ✅ FIX: was "ub1"
     "хэрэглээний бүтээгдэхүүн": "purpose",
-    # add more as needed:
-    # "удаан эдэлгээтэй": "sub1",
-    # "үйлдвэрлэлийн зориулалттай": "purpose",
 }
 
 
@@ -31,29 +28,52 @@ def _norm(s: str) -> str:
 
 
 def _find_year_month(q: str) -> tuple[Optional[int], Optional[int]]:
-    # 2025 оны 12 сар / 2025 12 сар / 2025-12 гэх мэтийг барина (энгийн)
+    # 2025 оны 12 сар / 2025 12 сар гэх мэтийг барина
     m = re.search(r"(20\d{2})\D+(\d{1,2})\D*сар", q)
     if m:
         return int(m.group(1)), int(m.group(2))
+
     m = re.search(r"\b(20\d{2})\D+(\d{1,2})\b", q)
     if m:
         y, mm = int(m.group(1)), int(m.group(2))
         if 1 <= mm <= 12:
             return y, mm
+
     return None, None
 
 
+def _find_years_list(q: str) -> Optional[List[int]]:
+    """
+    Find multi-year requests:
+    - "2024, 2025"
+    - "2024-2025" / "2024–2025"
+    - If 2+ distinct years found, return sorted list.
+    """
+    qn = _norm(q)
+
+    # range: 2024-2025 or 2024–2025
+    m = re.search(r"\b(20\d{2})\s*[-–]\s*(20\d{2})\b", qn)
+    if m:
+        y1, y2 = int(m.group(1)), int(m.group(2))
+        if y1 > y2:
+            y1, y2 = y2, y1
+        return list(range(y1, y2 + 1))
+
+    # list: pick all years
+    years = [int(x) for x in re.findall(r"\b(20\d{2})\b", qn)]
+    years = sorted(set(years))
+    if len(years) >= 2:
+        return years
+
+    # heuristic: "2 жил", "хоёр жил" without explicit years -> None (let it be latest/year rules)
+    return None
+
+
 def _infer_category_filters(question: str) -> Dict[str, str]:
-    """
-    Returns category filters like {"sub3": "Тамхи"} based on keyword hits.
-    Uses the original question (not casefolded) for values; we store the matched keyword
-    and rely on SQL builder to do ILIKE '%keyword%'.
-    """
     qn = _norm(question)
     out: Dict[str, str] = {}
     for kw, field in CATEGORY_KEYWORDS.items():
         if kw in qn:
-            # store the keyword itself (Title-case doesn't matter because ILIKE)
             out[field] = kw
     return out
 
@@ -67,7 +87,6 @@ def _infer_hscode(question: str) -> Optional[List[str]]:
         hs: List[str] = []
         for s in m:
             n = int(s)
-            # treat as year, not HS
             if 2000 <= n <= 2030:
                 continue
             hs.append(s)
@@ -99,14 +118,20 @@ def build_intent_fallback(question: str) -> Dict[str, Any]:
         metric = "amountUSD"
         calc = "month_value"
 
-    # time
-    y, m = _find_year_month(question)
-    if y and m:
-        time: Any = {"year": y, "month": m}
-    elif y:
-        time = {"year": y}
+    # ✅ timeseries_year heuristic (only when explicit multi-year is present)
+    years_list = _find_years_list(question)
+    if years_list:
+        calc = "timeseries_year"
+        time: Any = {"years": years_list}
     else:
-        time = "latest"
+        # time (single month/year/latest)
+        y, m = _find_year_month(question)
+        if y and m:
+            time = {"year": y, "month": m}
+        elif y:
+            time = {"year": y}
+        else:
+            time = "latest"
 
     filters: Dict[str, Any] = {}
 

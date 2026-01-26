@@ -32,11 +32,21 @@ def _unit(metric: str) -> str:
         return "тонн"
     return "ам.доллар/тонн"
 
+def _scale_info(metric: str) -> dict:
+    # Chart дээр default scale
+    if metric == "amountUSD":
+        return {"scale": 1_000_000.0, "scale_label": "сая"}  # USD -> сая
+    if metric == "quantity":
+        return {"scale": 1_000.0, "scale_label": "мянга"}   # тонн -> мянга (хүсвэл 1 болгож болно)
+    # weighted_price: scale хийхгүй
+    return {"scale": 1.0, "scale_label": ""}
 
 def _format_value(x: Any, metric: str) -> str:
     """
-    amountUSD / quantity -> сая нэгжээр харуулна
-    weighted_price -> хэвийн (2 орны нарийвчлал), сая болгохгүй
+    Display formatting aligned with _scale_info()
+    - amountUSD: "сая ам.доллар"
+    - quantity: "мянга тонн" (эсвэл scale=1 бол "тонн")
+    - weighted_price: "ам.доллар/тонн" (no scaling)
     """
     if x is None:
         return "—"
@@ -48,12 +58,20 @@ def _format_value(x: Any, metric: str) -> str:
 
     u = _unit(metric)
 
+    # weighted_price: no scaling, show 2 decimals
     if metric == "weighted_price":
         return f"{v:,.2f} {u}"
 
-    vv = v / 1_000_000.0
-    return f"{vv:,.2f} сая {u}"
+    scale_meta = _scale_info(metric)
+    sc = float(scale_meta.get("scale", 1.0) or 1.0)
+    label = scale_meta.get("scale_label", "")
 
+    vv = v / sc if sc else v
+
+    # label байвал "сая ам.доллар", "мянга тонн" гэх мэт
+    if label:
+        return f"{vv:,.2f} {label} {u}"
+    return f"{vv:,.2f} {u}"
 
 def _looks_analytic(q: str) -> bool:
     t = q.strip().casefold()
@@ -67,6 +85,8 @@ def _looks_analytic(q: str) -> bool:
 def _infer_period(calc: str, time_field: Any) -> str:
     if calc in ("timeseries_month",):
         return "series_month"
+    if calc in ("timeseries_year",):
+        return "series_year"
     if calc in ("ytd", "year_total", "avg_years"):
         return "year"
     return "month"
@@ -86,8 +106,25 @@ def _normalize_value_result(calc: str, rows: list[Dict[str, Any]]) -> Tuple[Dict
         }, None
 
     if calc == "timeseries_month":
-        series = [{"year": x.get("year"), "month": x.get("month"), "value": x.get("value")} for x in rows]
-        return {"series": series}, None
+        return {"series": [
+            {
+                "year": x.get("year"),
+                "month": x.get("month"),
+                "label": f"{x.get('year')}-{int(x.get('month') or 0):02d}",
+                "value": x.get("value"),
+            }
+            for x in rows
+        ]}, None
+
+    if calc == "timeseries_year":
+        return {"series": [
+            {
+                "year": x.get("year"),
+                "label": str(x.get("year")),
+                "value": x.get("value"),
+            }
+            for x in rows
+        ]}, None
 
     return {"value": r0.get("value")}, None
 
@@ -131,9 +168,9 @@ async def chat(
             "result": {"error": "invalid_intent", "detail": str(e)},
         }
 
-    calc = intent.get("calc")
-    metric = intent.get("metric")
-    domain = intent.get("domain")
+    calc = intent.get("calc") or "month_value"
+    metric = intent.get("metric") or "amountUSD"
+    domain = intent.get("domain") or "export"
 
     # 3) SQL + execute
     sql, params, sql_meta = build_sql(intent, q)
@@ -153,19 +190,45 @@ async def chat(
             "previous": _format_value(normalized.get("previous"), metric),
             "pct": "—" if normalized.get("pct") is None else f"{float(normalized['pct']):.2f}%",
         }
-    elif calc == "timeseries_month":
+    elif calc in ("timeseries_month", "timeseries_year"):
         display = None
     else:
         display = _format_value(normalized.get("value"), metric)
+
+    scale_meta = _scale_info(metric)
 
     result_contract: Dict[str, Any] = {
         **normalized,
         "display": display,
         "unit": unit,
         "period": period,
+        **scale_meta,  # ✅ scale, scale_label
     }
+
     if err_code:
         result_contract["warning"] = err_code
+
+    # ✅ add scaled values for frontend charts/tables
+    try:
+        sc = float(result_contract.get("scale", 1.0) or 1.0)
+    except Exception:
+        sc = 1.0
+
+    if "value" in result_contract and result_contract["value"] is not None:
+        try:
+            result_contract["value_scaled"] = float(result_contract["value"]) / sc
+        except Exception:
+            result_contract["value_scaled"] = None
+
+    if "series" in result_contract and isinstance(result_contract["series"], list):
+        for p in result_contract["series"]:
+            if p.get("value") is None:
+                p["value_scaled"] = None
+            else:
+                try:
+                    p["value_scaled"] = float(p["value"]) / sc
+                except Exception:
+                    p["value_scaled"] = None
 
     # 5) Base answer
     if calc == "yoy":
@@ -182,6 +245,8 @@ async def chat(
         )
     elif calc == "timeseries_month":
         base_answer = f"{domain} • {metric} • сар сараар цуваа гаргалаа."
+    elif calc == "timeseries_year":
+        base_answer = f"{domain} • {metric} • жил жилээр хүснэгт/цуваа гаргалаа."
     else:
         base_answer = f"{domain} • {calc} • {metric} = {display}"
 

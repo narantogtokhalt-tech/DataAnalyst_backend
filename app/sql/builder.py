@@ -60,6 +60,20 @@ def _time_parts(intent_time: Any) -> Tuple[Optional[int], Optional[int], bool]:
     # fallback latest
     return None, None, True
 
+def _time_years(intent_time: Any) -> Optional[List[int]]:
+    """
+    Returns list of years if time is {"years":[...]} else None
+    """
+    if isinstance(intent_time, dict) and isinstance(intent_time.get("years"), list):
+        years = []
+        for y in intent_time.get("years", []):
+            try:
+                years.append(int(y))
+            except Exception:
+                continue
+        years = sorted(set(years))
+        return years if years else None
+    return None
 
 def _where_filters(filters: Dict[str, Any], params: Dict[str, Any], need_company: bool) -> str:
     clauses = []
@@ -134,6 +148,7 @@ def build_sql(intent: Dict[str, Any], question: str) -> Tuple[Any, Dict[str, Any
     view = resolve_view(domain, need_company, filters)
 
     year, month, is_latest = _time_parts(intent.get("time", "latest"))
+    years_list = _time_years(intent.get("time"))
 
     params: Dict[str, Any] = {"topn": topn, "window": window}
     w = _where_filters(filters, params, need_company)
@@ -153,9 +168,15 @@ def build_sql(intent: Dict[str, Any], question: str) -> Tuple[Any, Dict[str, Any
         "view": view,
         "domain": domain,
         "need_company": need_company,
-        "calc": calc,
+        "calc": calc,                # 👈 аль хэдийн OK
         "metric": metric,
         "window": window,
+        "is_timeseries": calc.startswith("timeseries"),
+        "granularity": (
+            "year" if calc == "timeseries_year"
+            else "month" if calc == "timeseries_month"
+            else "single"
+        ),
     }
 
     # latest month CTE body (no leading WITH)
@@ -321,6 +342,54 @@ FROM {view}
 GROUP BY year, month
 ORDER BY year, month
 """
+        return text(sql_body), params, meta
+
+    if calc == "timeseries_year":
+        # years_list байх ёстой
+        if not years_list:
+            # is_latest үед: latest year total-г (1 мөр) буцаана
+            if is_latest:
+                base = w.replace("WHERE ", "")
+                extra = f" AND {base}" if base else ""
+                sql_body = f"""
+    SELECT
+      (SELECT y FROM latest_parts) AS year,
+      {metric_expr} AS value
+    FROM {view}
+    WHERE year = (SELECT y FROM latest_parts){extra}
+    GROUP BY 1
+    ORDER BY 1
+    """
+                return text(_with_prefix(sql_body)), params, meta
+
+            # explicit year өгөгдсөн бол тэр жилээр total (1 мөр)
+            if year is None:
+                year = 0
+            params["year"] = year
+            base_where = w + (" AND year = :year" if w else "WHERE year = :year")
+            sql_body = f"""
+    SELECT
+      CAST(:year AS int) AS year,
+      {metric_expr} AS value
+    FROM {view}
+    {base_where}
+    GROUP BY 1
+    ORDER BY 1
+    """
+            return text(sql_body), params, meta
+
+        # normal multi-year
+        params["years"] = years_list
+        base_where = w + (" AND year = ANY(CAST(:years AS int[]))" if w else "WHERE year = ANY(CAST(:years AS int[]))")
+        sql_body = f"""
+    SELECT
+      year::int AS year,
+      {metric_expr} AS value
+    FROM {view}
+    {base_where}
+    GROUP BY 1
+    ORDER BY 1
+    """
         return text(sql_body), params, meta
 
     if calc == "yoy":
