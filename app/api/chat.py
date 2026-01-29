@@ -267,25 +267,17 @@ async def chat(
 
     # ✅ SINGLE SOURCE OF TRUTH
     intent = state.to_intent() if state else {}
+    intent = canonicalize_intent(intent, state, q)
 
-    calc = intent.get("calc") or "month_value"
-    metric = intent.get("metric") or "amountUSD"
-    domain = intent.get("domain") or "export"
-
-    sql, params, sql_meta = build_sql(intent, q)
-
-    # 2) SQL + execute
+    # 1) SQL build + execute (✅ once)
     sql, params, sql_meta = build_sql(intent, q)
     r = await db.execute(sql, params)
     rows = [dict(x) for x in r.mappings().all()][:500]
 
-    # 3) Normalize
-    normalized, err_code = _normalize_value_result(calc, rows)
-
-    # 2) SQL + execute
-    sql, params, sql_meta = build_sql(intent, q)
-    r = await db.execute(sql, params)
-    rows = [dict(x) for x in r.mappings().all()][:500]
+    # ✅ IMPORTANT: use sql_meta overrides
+    calc = sql_meta.get("calc") or intent.get("calc") or "month_value"
+    metric = sql_meta.get("metric") or intent.get("metric") or "amountUSD"
+    domain = sql_meta.get("domain") or intent.get("domain") or "export"
 
     # 3) Normalize
     normalized, err_code = _normalize_value_result(calc, rows)

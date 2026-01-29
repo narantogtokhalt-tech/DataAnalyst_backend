@@ -153,6 +153,19 @@ def build_sql(intent: Dict[str, Any], question: str) -> Tuple[Any, Dict[str, Any
     year, month, is_latest = _time_parts(intent.get("time", "latest"))
     years_list = _time_years(intent.get("time"))
 
+    # ----------------------------
+    # ✅ Rule-based calc override
+    # ----------------------------
+    qn = _norm(question)
+
+    wants_total = any(k in qn for k in ("нийт", "нийлбэр", "total"))
+    asking_amount = any(k in qn for k in ("хэд", "хэчнээн", "дүн", "утга", "value"))
+
+    # "2025 оны нийт ... хэд вэ" -> year_total
+    if (not is_latest) and (year is not None) and (month is None) and wants_total and asking_amount:
+        calc = "year_total"
+
+
     params: Dict[str, Any] = {"topn": topn, "window": window}
     w = _where_filters(filters, params, need_company)
 
@@ -218,55 +231,75 @@ latest_parts AS (
         For month-level queries: append (year,month) filter.
         """
         if is_latest:
-            time_clause = "year = (SELECT y FROM latest_parts) AND month = (SELECT m FROM latest_parts)"
-            if where_sql:
-                return where_sql + " AND " + time_clause
-            return "WHERE " + time_clause
+            time_clause = (
+                "year = (SELECT y FROM latest_parts) "
+                "AND month = (SELECT m FROM latest_parts)"
+            )
+            return (where_sql + " AND " + time_clause) if where_sql else ("WHERE " + time_clause)
 
+        # ✅ Explicit year+month
         if year is not None and month is not None:
-            params["year"] = year
-            params["month"] = month
+            params["year"] = int(year)
+            params["month"] = int(month)
             time_clause = "year = :year AND month = :month"
+            return (where_sql + " AND " + time_clause) if where_sql else ("WHERE " + time_clause)
 
+        # ✅ No year → treat as latest year (month-level queries still need a year)
         if year is None:
-            # year өгөгдөөгүй бол latest гэж үзнэ
             time_clause = "year = (SELECT y FROM latest_parts)"
-        else:
-            params["year"] = year
-            time_clause = "year = :year"
+            return (where_sql + " AND " + time_clause) if where_sql else ("WHERE " + time_clause)
 
-        if where_sql:
-            return where_sql + " AND " + time_clause
-        return "WHERE " + time_clause
+        # ✅ Year only
+        params["year"] = int(year)
+        time_clause = "year = :year"
+        return (where_sql + " AND " + time_clause) if where_sql else ("WHERE " + time_clause)
 
     # -------------------
     # calc cases
     # -------------------
 
     if calc == "month_value":
-        where2 = _append_time_month(w)
+            # ✅ If only year is provided, month_value is ambiguous → treat as monthly timeseries
+            if (not is_latest) and (year is not None) and (month is None):
+                params["year"] = int(year)
+                base = w + (" AND year = :year" if w else "WHERE year = :year")
 
-        if is_latest:
+                sql_body = f"""
+    SELECT year, month, {metric_expr} AS value
+    FROM {view}
+    {base}
+    GROUP BY year, month
+    ORDER BY year, month
+    """
+                # ✅ meta-г зөв болгож өгнө
+                meta["calc"] = "timeseries_month"
+                meta["is_timeseries"] = True
+                meta["granularity"] = "month"
+                return text(sql_body), params, meta
+
+            where2 = _append_time_month(w)
+
+            if is_latest:
+                sql_body = f"""
+    SELECT
+      (SELECT y FROM latest_parts) AS year,
+      (SELECT m FROM latest_parts) AS month,
+      {metric_expr} AS value
+    FROM {view}
+    {where2}
+    """
+                return text(_with_prefix(sql_body)), params, meta
+
+            # explicit time (year+month)
             sql_body = f"""
-SELECT
-  (SELECT y FROM latest_parts) AS year,
-  (SELECT m FROM latest_parts) AS month,
-  {metric_expr} AS value
-FROM {view}
-{where2}
-"""
-            return text(_with_prefix(sql_body)), params, meta
-
-        # explicit time
-        sql_body = f"""
-SELECT
-  CAST(:year AS int) AS year,
-  CAST(:month AS int) AS month,
-  {metric_expr} AS value
-FROM {view}
-{where2}
-"""
-        return text(sql_body), params, meta
+    SELECT
+      CAST(:year AS int) AS year,
+      CAST(:month AS int) AS month,
+      {metric_expr} AS value
+    FROM {view}
+    {where2}
+    """
+            return text(sql_body), params, meta
 
     if calc == "year_total":
         if is_latest:
