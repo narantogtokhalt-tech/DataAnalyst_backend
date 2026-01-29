@@ -31,21 +31,34 @@ CATEGORY_KEYWORDS: Dict[str, str] = {
     "хэрэглээний бүтээгдэхүүн": "purpose",
 }
 
+
 def _norm(s: str) -> str:
     return (s or "").strip().casefold()
 
 
 def _find_year_month(q: str) -> tuple[Optional[int], Optional[int]]:
-    # 2025 оны 12 сар / 2025 12 сар гэх мэтийг барина
+    """
+    Returns (year, month)
+    - "2025 оны 12 сар"
+    - "2025 12"
+    - "2025"  -> (2025, None)  ✅ clarify answer
+    """
+    # 2025 оны 12 сар / 2025 ... 12 ... сар
     m = re.search(r"(20\d{2})\D+(\d{1,2})\D*сар", q)
     if m:
         return int(m.group(1)), int(m.group(2))
 
+    # 2025 12 (month validation)
     m = re.search(r"\b(20\d{2})\D+(\d{1,2})\b", q)
     if m:
         y, mm = int(m.group(1)), int(m.group(2))
         if 1 <= mm <= 12:
             return y, mm
+
+    # ✅ single year only (e.g. "2025")
+    m = re.search(r"\b(20\d{2})\b", q)
+    if m:
+        return int(m.group(1)), None
 
     return None, None
 
@@ -73,7 +86,6 @@ def _find_years_list(q: str) -> Optional[List[int]]:
     if len(years) >= 2:
         return years
 
-    # heuristic: "2 жил", "хоёр жил" without explicit years -> None (let it be latest/year rules)
     return None
 
 
@@ -109,11 +121,41 @@ def _infer_hscode(question: str) -> Optional[List[str]]:
     return None
 
 
-def build_intent_fallback(question: str) -> Dict[str, Any]:
-    q = _norm(question)
+def _get_prev_domain(prev_state: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(prev_state, dict):
+        return None
+    d = prev_state.get("domain")
+    if d in ("import", "export"):
+        return d
+    return None
 
-    # domain
-    domain = "import" if "импорт" in q else "export"
+
+def build_intent_fallback(
+    question: str, prev_state: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    q = _norm(question)
+    prev_domain = _get_prev_domain(prev_state)
+
+    # Category filters first (avoid HS over-broad grouping cases like 2710)
+    filters: Dict[str, Any] = {}
+    cat_filters = _infer_category_filters(question)
+    if cat_filters:
+        filters.update(cat_filters)
+
+    # ✅ domain (robust)
+    # 1) explicit keyword wins
+    if "импорт" in q:
+        domain = "import"
+    elif "экспорт" in q:
+        domain = "export"
+    else:
+        # 2) if category keyword matched → it is import-category vocabulary in your system
+        #    (this avoids "2025" turning into export after clarification)
+        if cat_filters:
+            domain = "import"
+        else:
+            # 3) keep previous domain
+            domain = prev_domain or "export"
 
     # metric + calc
     if "нэгж" in q or "нэгж үнэ" in q or "дундаж үнэ" in q or "unit price" in q:
@@ -138,17 +180,14 @@ def build_intent_fallback(question: str) -> Dict[str, Any]:
             time = {"year": y, "month": m}
         elif y:
             time = {"year": y}
+            # ✅ year-only: default to monthly series (more reliable expectation)
+            if calc == "month_value":
+                calc = "timeseries_month"
         else:
             time = "latest"
 
-    filters: Dict[str, Any] = {}
-
-    # Category filters first (avoid HS over-broad grouping cases like 2710)
-    cat_filters = _infer_category_filters(question)
-    if cat_filters:
-        filters.update(cat_filters)
-    else:
-        # Only infer HS codes if no category keyword matched
+    # If no category filter matched, infer HS code
+    if not cat_filters:
         hs = _infer_hscode(question)
         if hs:
             filters["hscode"] = hs

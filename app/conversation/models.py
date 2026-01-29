@@ -60,6 +60,9 @@ class ConversationState(BaseModel):
     domain: Optional[Domain] = None
     metric: Optional[Metric] = None
     unit: Optional[str] = None
+    awaiting_clarification: bool = False
+    pending_question: Optional[str] = None
+    pending_clarify: Optional[Dict[str, Any]] = None
 
     time: TimeSpec = Field(default_factory=TimeSpec)
     commodity: Optional[Commodity] = None
