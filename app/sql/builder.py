@@ -13,6 +13,23 @@ HS_CODE_MAP = {
     "газрын тос": ["2709"],
 }
 
+CATEGORY_KEYWORDS: Dict[str, str] = {
+    "тамхи": "sub3",
+    "суудлын автомашин": "sub3",
+    "хүнс": "sub2",
+    "автобензин": "sub2",
+    "түргэн эдэлгээтэй": "sub1",
+    "хэрэглээний бүтээгдэхүүн": "purpose",
+}
+
+def _infer_category_filters(question: str) -> Dict[str, str]:
+    qn = _norm(question)
+    out: Dict[str, str] = {}
+    for kw, field in CATEGORY_KEYWORDS.items():
+        if kw in qn:
+            out[field] = kw
+    return out
+
 
 def _norm(s: Any) -> str:
     return str(s).strip().casefold()
@@ -130,7 +147,10 @@ def build_sql(intent: Dict[str, Any], question: str) -> Tuple[Any, Dict[str, Any
     domain = intent.get("domain", "export")
     calc = intent.get("calc", "month_value")
     metric = intent.get("metric", "amountUSD")
-    filters = intent.get("filters") or {}
+
+    raw_filters = intent.get("filters") or {}
+    filters: Dict[str, Any] = raw_filters if isinstance(raw_filters, dict) else {}
+
     topn = int(intent.get("topn", 50) or 50)
 
     # avg window
@@ -138,34 +158,56 @@ def build_sql(intent: Dict[str, Any], question: str) -> Tuple[Any, Dict[str, Any
     if window <= 0:
         window = 3
 
-    # Server-side hscode fallback (LLM алдахад)
+    qn = _norm(question)
+
+    # -------------------------------------------------
+    # ✅ 1) Category fallback (always wins; never mix HS)
+    # -------------------------------------------------
+    cat_filters = _infer_category_filters(question)
+    if cat_filters:
+        filters.update(cat_filters)
+        filters.pop("hscode", None)
+
     has_category = any(filters.get(k) for k in ("purpose", "sub1", "sub2", "sub3"))
 
-    # Server-side hscode fallback (LLM алдахад) — ✅ category үед хийхгүй
-    if (not has_category) and (not filters.get("hscode")) and ("нийт" not in _norm(question)):
+    # -------------------------------------------------
+    # ✅ 2) HS fallback (only if NOT category and NOT "нийт")
+    # -------------------------------------------------
+    if (not has_category) and (not filters.get("hscode")) and ("нийт" not in qn):
         hs = _infer_hscode(question)
         if hs:
             filters["hscode"] = hs
 
-    need_company = bool(filters.get("company")) and domain == "export"
-    view, view_type = resolve_view(domain, need_company, filters)
-
+    # -------------------------------------------------
+    # ✅ 3) Time parse + HARD RULE for multi-year
+    # -------------------------------------------------
     year, month, is_latest = _time_parts(intent.get("time", "latest"))
     years_list = _time_years(intent.get("time"))
 
-    # ----------------------------
-    # ✅ Rule-based calc override
-    # ----------------------------
-    qn = _norm(question)
+    # ✅ HARD RULE: multi-year => timeseries_year only
+    if years_list:
+        calc = "timeseries_year"
 
+    # -------------------------------------------------
+    # ✅ 4) Rule-based calc override (single-year only)
+    # -------------------------------------------------
     wants_total = any(k in qn for k in ("нийт", "нийлбэр", "total"))
     asking_amount = any(k in qn for k in ("хэд", "хэчнээн", "дүн", "утга", "value"))
 
     # "2025 оны нийт ... хэд вэ" -> year_total
-    if (not is_latest) and (year is not None) and (month is None) and wants_total and asking_amount:
+    # ⚠️ multi-year үед ажиллуулахгүй (HARD RULE дарна)
+    if (not years_list) and (not is_latest) and (year is not None) and (month is None) and wants_total and asking_amount:
         calc = "year_total"
 
+    # -------------------------------------------------
+    # ✅ 5) Resolve view AFTER filters are stable
+    # -------------------------------------------------
+    need_company = bool(filters.get("company")) and domain == "export"
+    view, view_type = resolve_view(domain, need_company, filters)
 
+    # -------------------------------------------------
+    # ✅ 6) Params + where
+    # -------------------------------------------------
     params: Dict[str, Any] = {"topn": topn, "window": window}
     w = _where_filters(filters, params, need_company)
 
@@ -185,7 +227,7 @@ def build_sql(intent: Dict[str, Any], question: str) -> Tuple[Any, Dict[str, Any
         "view_type": view_type,
         "domain": domain,
         "need_company": need_company,
-        "calc": calc,                # 👈 аль хэдийн OK
+        "calc": calc,
         "metric": metric,
         "window": window,
         "is_timeseries": calc.startswith("timeseries"),
